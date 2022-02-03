@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"time"
@@ -50,7 +49,7 @@ func run(local, remote string) error {
 			}
 		}
 	}()
-	log.Printf("About to listen on %v\n", local)
+	log.Printf("Proxying from %v to %v\n", local, remote)
 	return http.ListenAndServe(local, p)
 }
 
@@ -66,9 +65,7 @@ func NewProxy(baseURL string) (p http.Handler, messages chan string, errors chan
 	messages = signer.Messages
 	errors = signer.Errors
 
-	pp := httputil.NewSingleHostReverseProxy(u)
-	pp.Director = signer.Sign
-	return pp, messages, errors, nil
+	return signer, messages, errors, nil
 }
 
 type Signer struct {
@@ -97,21 +94,20 @@ func NewSigner(u *url.URL) (c Signer, err error) {
 
 const emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-func (c Signer) Sign(r *http.Request) {
+func (c Signer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// If there is no payload, default to an empty buffer and the empty hash.
 	hash := emptyHash
-	body := new(bytes.Buffer)
+	var body []byte
 	if r.Body != nil {
-		// Hasher to compute body hash.
-		bodyHasher := sha256.New()
-
-		// Calculate the hash and copy it to the buffer.
-		_, err := io.Copy(io.MultiWriter(bodyHasher, body), r.Body)
+		var err error
+		body, err = io.ReadAll(r.Body)
 		if err != nil {
-			c.Errors <- fmt.Errorf("v4sigproxy: failed to hash request: %w", err)
+			c.Errors <- fmt.Errorf("v4sigproxy: failed to read body: %w", err)
 			return
 		}
-		hash = hex.EncodeToString(bodyHasher.Sum(nil))
+		// Hasher to compute body hash.
+		h := sha256.Sum256(body)
+		hash = hex.EncodeToString(h[:])
 	}
 
 	before := r.URL.String()
@@ -121,18 +117,37 @@ func (c Signer) Sign(r *http.Request) {
 	after := r.URL.String()
 	c.Messages <- fmt.Sprintf("%v -> %v with body %v", before, after, hash)
 
+	req, err := http.NewRequest(r.Method, after, bytes.NewReader(body))
+	if err != nil {
+		c.Errors <- fmt.Errorf("v4sigproxy: failed to create outbound request: %w", err)
+		return
+	}
 	// Get signing credentials.
-	creds, err := c.cfg.Credentials.Retrieve(r.Context())
+	creds, err := c.cfg.Credentials.Retrieve(context.Background())
 	if err != nil {
 		c.Errors <- fmt.Errorf("v4sigproxy: failed to retrieve creds: %w", err)
 		return
 	}
-
-	// Sign the request.
-	r.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
-	err = c.signer.SignHTTP(r.Context(), creds, r, hash, "execute-api", c.region, c.now())
+	err = c.signer.SignHTTP(context.Background(), creds, req, hash, "execute-api", c.region, c.now())
 	if err != nil {
 		c.Errors <- fmt.Errorf("v4sigproxy: failed to sign request: %w", err)
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.Errors <- fmt.Errorf("v4sigproxy: failed to make outbound request: %w", err)
+		return
+	}
+
+	// Return response.
+	// Copy headers over.
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+	// Copy body.
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		c.Errors <- fmt.Errorf("v4sigproxy: failed to copy bound from remote to client: %w", err)
 		return
 	}
 	return
